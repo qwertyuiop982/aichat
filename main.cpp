@@ -4,10 +4,30 @@
 static QString configPath() { return QDir::homePath() + "/.aiclaw/config.json"; }
 static QString sessionsPath() { return QDir::homePath() + "/.aiclaw/sessions"; }
 static QString workspacePath() { return qEnvironmentVariable("AICLAW_WORKSPACE", QDir::currentPath()); }
-static QString safePath(const QString &raw) { QFileInfo root(workspacePath()), candidate(raw.isEmpty() ? root.absoluteFilePath() : (QDir::isAbsolutePath(raw) ? raw : root.absoluteFilePath(raw))); QString r=root.canonicalFilePath(), c=candidate.canonicalFilePath(); if (r.isEmpty()) r=root.absoluteFilePath(); if (c.isEmpty()) c=candidate.absoluteFilePath(); return (c==r || c.startsWith(r+"/")) ? c : QString(); }
+static QString safePath(const QString &raw) {
+    QFileInfo root(workspacePath());
+    QFileInfo candidate(raw.isEmpty() ? root.absoluteFilePath()
+        : (QDir::isAbsolutePath(raw) ? raw : QDir(root.absoluteFilePath()).filePath(raw)));
+    QString r = root.canonicalFilePath(), c = candidate.canonicalFilePath();
+    if (r.isEmpty()) r = root.absoluteFilePath();
+    if (c.isEmpty()) c = candidate.absoluteFilePath();
+    return (c == r || c.startsWith(r + "/")) ? c : QString();
+}
 
 static QString toolsPrompt() {
-    return "\n\n# Tool calling\nWhen tools are enabled, call a tool with a fenced JSON block:\n```tool_call\n{\"name\":\"list_dir|read_file|grep_search|shell\",\"arguments\":{...}}\n```\nAfter a result is returned, answer the user. Available tools: list_dir(path), read_file(path), grep_search(pattern,path), shell(command).";
+    return "\n\n# Tool calling\n"
+        "Native function/tool calling is preferred when supported. Legacy fallback format:\n"
+        "```tool_call\n"
+        "{\"name\":\"<tool_name>\",\"arguments\":{...}}\n"
+        "```\n"
+        "Available tools:\n"
+        "- file_op(op:string, path:string, content?:string, dest?:string, recursive?:boolean, overwrite?:boolean) - Perform file operations in workspace: write, append, delete, move, copy, mkdir.\n"
+        "- grep_search(pattern:string, path:string) - Search a file/dir with grep -rEn.\n"
+        "- list_dir(path:string) - List workspace directory children.\n"
+        "- read_file(path:string) - Read a workspace text file.\n"
+        "- shell(command:string) - Run an allowlisted local command.\n"
+        "- web_fetch(url:string, maxBytes?:integer, start?:integer, selector?:string, timeoutMs?:integer) - Fetch a public HTTP/HTTPS page.\n"
+        "- web_search(query:string, limit?:integer) - Search Bing and return top results.\n";
 }
 
 class SettingsDialog : public QDialog {
@@ -121,16 +141,277 @@ private:
     }
     void refreshTitle() { title->setText("aiclaw  |  " + current + " / " + cfg["model"].toString() + (cfg["toolsEnabled"].toBool() ? "  | tools on" : "")); }
     QJsonArray apiMessages() const {
-        QJsonArray out = history; QString system = cfg["system"].toString(); if (cfg["toolsEnabled"].toBool() && cfg["toolPromptEnabled"].toBool()) system += toolsPrompt(); if (cfg["toolsEnabled"].toBool()) system += "\nWhen reasoning, wrap it in <think> and </think>.";
+        QJsonArray out = history; QString system = cfg["system"].toString(); if (cfg["toolsEnabled"].toBool() && cfg["toolPromptEnabled"].toBool()) system += toolsPrompt(); if (cfg["toolsEnabled"].toBool()) system += "\nWhen reasoning, wrap it in  and </think>.";
         if (!system.trimmed().isEmpty()) out.prepend(QJsonObject{{"role", "system"}, {"content", system}}); return out;
     }
+
+    // Run a curl command synchronously via QProcess
+    static QString curlSync(const QStringList &args, int timeoutMs = 20000) {
+        QProcess p;
+        p.start("curl", args);
+        if (!p.waitForFinished(timeoutMs)) { p.kill(); return "ERROR: curl timeout"; }
+        QString out = QString::fromUtf8(p.readAllStandardOutput());
+        QString err = QString::fromUtf8(p.readAllStandardError());
+        if (p.exitCode() != 0 && out.isEmpty()) return "ERROR: curl failed (exit " + QString::number(p.exitCode()) + "): " + err.left(500);
+        return out;
+    }
+
     QString runTool(const QString &name, const QJsonObject &args) {
-        if (name == "list_dir") { QString p=safePath(args["path"].toString()); if(p.isEmpty()) return "ERROR: path outside workspace"; QDir dir(p); return dir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).join("\n"); }
-        if (name == "read_file") { QString p=safePath(args["path"].toString()); if(p.isEmpty()) return "ERROR: path outside workspace"; QFile file(p); if (!file.open(QIODevice::ReadOnly)) return "ERROR: " + file.errorString(); return QString::fromUtf8(file.read(200000)); }
-        if (name == "grep_search") { QString safe=safePath(args["path"].toString()); if(safe.isEmpty()) return "ERROR: path outside workspace"; QProcess p; p.start("grep", {"-rEn", args["pattern"].toString(), safe}); p.waitForFinished(20000); return QString::fromUtf8(p.readAllStandardOutput()).left(200000); }
-        if (name == "shell") { QStringList parts=args["command"].toString().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts); if(parts.isEmpty()) return "ERROR: empty command"; static const QStringList allow={"pwd","ls","find","grep","cat","head","tail","wc","git","node","npm","cmake","make","ninja","clang","clang++","qmake","python","python3","echo","printf","sed","sort","du","file"}; if(!allow.contains(QFileInfo(parts[0]).fileName())) return "ERROR: command not allowed"; QProcess p; p.setWorkingDirectory(workspacePath()); p.start(parts.takeFirst(), parts); if(!p.waitForFinished(15000)) { p.kill(); return "ERROR: command timeout"; } return QString::fromUtf8(p.readAllStandardOutput()+p.readAllStandardError()).left(200000); }
+        if (name == "list_dir") {
+            QString p = safePath(args["path"].toString());
+            if (p.isEmpty()) return "ERROR: path outside workspace";
+            QDir dir(p);
+            return dir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).join("\n");
+        }
+        if (name == "read_file") {
+            QString p = safePath(args["path"].toString());
+            if (p.isEmpty()) return "ERROR: path outside workspace";
+            QFile file(p);
+            if (!file.open(QIODevice::ReadOnly)) return "ERROR: " + file.errorString();
+            return QString::fromUtf8(file.read(200000));
+        }
+        if (name == "grep_search") {
+            QString safe = safePath(args["path"].toString());
+            if (safe.isEmpty()) return "ERROR: path outside workspace";
+            QProcess p;
+            p.start("grep", {"-rEn", args["pattern"].toString(), safe});
+            p.waitForFinished(20000);
+            return QString::fromUtf8(p.readAllStandardOutput()).left(200000);
+        }
+        if (name == "shell") {
+            QStringList parts = args["command"].toString().split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+            if (parts.isEmpty()) return "ERROR: empty command";
+            static const QStringList allow = {"pwd","ls","find","grep","cat","head","tail","wc","git","node","npm","cmake","make","ninja","clang","clang++","qmake","python","python3","echo","printf","sed","sort","du","file"};
+            if (!allow.contains(QFileInfo(parts[0]).fileName())) return "ERROR: command not allowed";
+            QProcess p;
+            p.setWorkingDirectory(workspacePath());
+            p.start(parts.takeFirst(), parts);
+            if (!p.waitForFinished(15000)) { p.kill(); return "ERROR: command timeout"; }
+            return QString::fromUtf8(p.readAllStandardOutput() + p.readAllStandardError()).left(200000);
+        }
+        if (name == "file_op") {
+            QString op = args["op"].toString().trimmed();
+            if (op.isEmpty()) return "ERROR: op required";
+            QString target = safePath(args["path"].toString());
+            if (target.isEmpty()) return "ERROR: path outside workspace";
+
+            if (op == "write") {
+                QString content = args["content"].toString();
+                bool overwrite = args["overwrite"].toBool(true);
+                if (!overwrite && QFile::exists(target)) return "ERROR: file exists, overwrite=false";
+                QDir dir = QFileInfo(target).absoluteDir();
+                if (!dir.exists()) dir.mkpath(".");
+                QFile file(target);
+                if (!file.open(QIODevice::WriteOnly)) return "ERROR: " + file.errorString();
+                file.write(content.toUtf8());
+                file.close();
+                return QJsonDocument(QJsonObject{{"op", "write"}, {"path", target}, {"bytes", content.size()}}).toJson(QJsonDocument::Compact);
+            }
+            if (op == "append") {
+                QString content = args["content"].toString();
+                if (!QFile::exists(target)) return "ERROR: file does not exist";
+                QFile file(target);
+                if (!file.open(QIODevice::Append)) return "ERROR: " + file.errorString();
+                file.write(content.toUtf8());
+                file.close();
+                QFileInfo info(target);
+                return QJsonDocument(QJsonObject{{"op", "append"}, {"path", target}, {"bytes", (int)info.size()}}).toJson(QJsonDocument::Compact);
+            }
+            if (op == "delete") {
+                if (!QFile::exists(target)) return "ERROR: path does not exist";
+                QFileInfo info(target);
+                bool ok;
+                if (info.isDir()) {
+                    QDir dir(target);
+                    ok = dir.removeRecursively();
+                } else {
+                    ok = QFile::remove(target);
+                }
+                if (!ok) return "ERROR: delete failed";
+                return QJsonDocument(QJsonObject{{"op", "delete"}, {"path", target}, {"type", info.isDir() ? "dir" : "file"}}).toJson(QJsonDocument::Compact);
+            }
+            if (op == "move") {
+                QString dest = args["dest"].toString();
+                if (dest.isEmpty()) return "ERROR: dest required";
+                QString destPath = safePath(dest);
+                if (destPath.isEmpty()) return "ERROR: dest path outside workspace";
+                if (!QFile::exists(target)) return "ERROR: source does not exist";
+                QDir dir = QFileInfo(destPath).absoluteDir();
+                if (!dir.exists()) dir.mkpath(".");
+                if (!QFile::rename(target, destPath)) return "ERROR: move failed";
+                return QJsonDocument(QJsonObject{{"op", "move"}, {"from", target}, {"to", destPath}}).toJson(QJsonDocument::Compact);
+            }
+            if (op == "copy") {
+                QString dest = args["dest"].toString();
+                if (dest.isEmpty()) return "ERROR: dest required";
+                QString destPath = safePath(dest);
+                if (destPath.isEmpty()) return "ERROR: dest path outside workspace";
+                if (!QFile::exists(target)) return "ERROR: source does not exist";
+                QDir dir = QFileInfo(destPath).absoluteDir();
+                if (!dir.exists()) dir.mkpath(".");
+                QFileInfo info(target);
+                bool ok;
+                if (info.isDir()) {
+                    // Use cp -r for directories
+                    QProcess cp;
+                    cp.start("cp", {"-r", target, destPath});
+                    cp.waitForFinished(30000);
+                    ok = (cp.exitCode() == 0);
+                } else {
+                    ok = QFile::copy(target, destPath);
+                }
+                if (!ok) return "ERROR: copy failed";
+                return QJsonDocument(QJsonObject{{"op", "copy"}, {"from", target}, {"to", destPath}, {"type", info.isDir() ? "dir" : "file"}}).toJson(QJsonDocument::Compact);
+            }
+            if (op == "mkdir") {
+                if (QFile::exists(target)) {
+                    QFileInfo info(target);
+                    if (info.isDir()) return QJsonDocument(QJsonObject{{"op", "mkdir"}, {"path", target}, {"existed", true}}).toJson(QJsonDocument::Compact);
+                    return "ERROR: path exists but is not a directory";
+                }
+                bool recursive = args["recursive"].toBool(true);
+                QDir dir;
+                bool ok = recursive ? dir.mkpath(target) : dir.mkdir(target);
+                if (!ok) return "ERROR: mkdir failed";
+                return QJsonDocument(QJsonObject{{"op", "mkdir"}, {"path", target}, {"recursive", recursive}}).toJson(QJsonDocument::Compact);
+            }
+            return "ERROR: unknown op: " + op;
+        }
+        if (name == "web_fetch") {
+            QString url = args["url"].toString();
+            if (url.isEmpty()) return "ERROR: url required";
+            int maxBytes = qBound(1024, args["maxBytes"].toInt(200000), 5000000);
+            int start = args["start"].toInt(0);
+            QString selector = args["selector"].toString();
+            int timeoutMs = qBound(3000, args["timeoutMs"].toInt(20000), 60000);
+
+            QStringList curlArgs = {
+                "-sS", "-L",
+                "--max-time", QString::number(timeoutMs / 1000),
+                "--max-filesize", QString::number(maxBytes * 2),
+                "-H", "User-Agent: Mozilla/5.0 (Linux; Android 14; Termux) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0 Mobile Safari/537.36",
+                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                url
+            };
+            QString raw = curlSync(curlArgs, timeoutMs + 5000);
+            if (raw.startsWith("ERROR:")) return raw;
+
+            QString slice = raw.mid(start, maxBytes);
+            if (!selector.isEmpty()) {
+                int i = slice.indexOf(selector, 0, Qt::CaseInsensitive);
+                if (i >= 0) slice = slice.mid(i);
+            }
+            // Strip HTML tags
+            QString text = slice;
+            text.remove(QRegularExpression("<script\\b[^>]*>[\\s\\S]*?</script>", QRegularExpression::CaseInsensitiveOption));
+            text.remove(QRegularExpression("<style\\b[^>]*>[\\s\\S]*?</style>", QRegularExpression::CaseInsensitiveOption));
+            text.remove(QRegularExpression("<[^>]+>"));
+            text.replace("&nbsp;", " ");
+            text.replace("&amp;", "&");
+            text.replace("&lt;", "<");
+            text.replace("&gt;", ">");
+            text.replace("&quot;", "\"");
+            text.replace(QRegularExpression("\\s+"), " ");
+            text = text.trimmed();
+
+            QJsonObject result;
+            result["url"] = url;
+            result["content"] = text;
+            result["truncated"] = raw.length() > start + maxBytes;
+            return QJsonDocument(result).toJson(QJsonDocument::Compact);
+        }
+        if (name == "web_search") {
+            QString query = args["query"].toString().trimmed();
+            if (query.isEmpty()) return "ERROR: query required";
+            int limit = qBound(1, args["limit"].toInt(8), 20);
+
+            QString searchUrl = "https://www.bing.com/search?q=" + QUrl::toPercentEncoding(query);
+            QStringList curlArgs = {
+                "-sS", "-L",
+                "--max-time", "20",
+                "-H", "User-Agent: Mozilla/5.0 (Linux; Android 14; Termux) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0 Mobile Safari/537.36",
+                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "-H", "Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8",
+                searchUrl
+            };
+            QString html = curlSync(curlArgs, 25000);
+            if (html.startsWith("ERROR:")) return html;
+
+            // Parse Bing results
+            QJsonArray results;
+            QRegularExpression liRe("<li[^>]*class=\"[^\"]*b_algo[^\"]*\"[^>]*>([\\s\\S]*?)</li>", QRegularExpression::CaseInsensitiveOption);
+            QRegularExpressionMatchIterator it = liRe.globalMatch(html);
+
+            while (it.hasNext() && results.size() < limit) {
+                QRegularExpressionMatch match = it.next();
+                QString block = match.captured(1);
+
+                // Extract URL
+                QString resultUrl;
+                QRegularExpression headerRe("<div[^>]*class=\"[^\"]*b_algoheader[^\"]*\"[^>]*>\\s*<a[^>]+href=\"([^\"]+)\"[^>]*>", QRegularExpression::CaseInsensitiveOption);
+                QRegularExpressionMatch headerMatch = headerRe.match(block);
+                if (headerMatch.hasMatch()) {
+                    resultUrl = headerMatch.captured(1);
+                } else {
+                    QRegularExpression anyRe("<a[^>]+href=\"([^\"]+)\"[^>]*>", QRegularExpression::CaseInsensitiveOption);
+                    QRegularExpressionMatch anyMatch = anyRe.match(block);
+                    if (anyMatch.hasMatch()) resultUrl = anyMatch.captured(1);
+                }
+                if (resultUrl.isEmpty()) continue;
+                if (resultUrl.startsWith("//")) resultUrl = "https:" + resultUrl;
+                else if (resultUrl.startsWith("/")) resultUrl = "https://www.bing.com" + resultUrl;
+                if (!resultUrl.startsWith("http", Qt::CaseInsensitive)) continue;
+
+                // Extract title
+                QString title;
+                QRegularExpression titleRe("<h2[^>]*>([\\s\\S]*?)</h2>", QRegularExpression::CaseInsensitiveOption);
+                QRegularExpressionMatch titleMatch = titleRe.match(block);
+                if (titleMatch.hasMatch()) {
+                    title = titleMatch.captured(1);
+                    title.remove(QRegularExpression("<[^>]+>"));
+                    title.replace("&amp;", "&"); title.replace("&lt;", "<"); title.replace("&gt;", ">");
+                    title.replace("&quot;", "\""); title.replace("&#39;", "'"); title.replace("&nbsp;", " ");
+                    title = title.simplified();
+                }
+                if (title.isEmpty()) continue;
+
+                // Extract snippet
+                QString snippet;
+                QRegularExpression snippetRe("<p[^>]*class=\"[^\"]*b_lineclamp[^\"]*\"[^>]*>([\\s\\S]*?)</p>", QRegularExpression::CaseInsensitiveOption);
+                QRegularExpressionMatch snippetMatch = snippetRe.match(block);
+                if (snippetMatch.hasMatch()) {
+                    snippet = snippetMatch.captured(1);
+                } else {
+                    QRegularExpression pRe("<p[^>]*>([\\s\\S]*?)</p>", QRegularExpression::CaseInsensitiveOption);
+                    QRegularExpressionMatch pMatch = pRe.match(block);
+                    if (pMatch.hasMatch()) snippet = pMatch.captured(1);
+                }
+                if (!snippet.isEmpty()) {
+                    snippet.remove(QRegularExpression("<[^>]+>"));
+                    snippet.replace("&amp;", "&"); snippet.replace("&lt;", "<"); snippet.replace("&gt;", ">");
+                    snippet.replace("&quot;", "\""); snippet.replace("&#39;", "'"); snippet.replace("&nbsp;", " ");
+                    snippet = snippet.simplified().left(400);
+                }
+
+                QJsonObject r;
+                r["title"] = title;
+                r["url"] = resultUrl;
+                r["snippet"] = snippet;
+                results.append(r);
+            }
+
+            if (results.isEmpty()) return "ERROR: no results parsed from bing";
+
+            QJsonObject output;
+            output["query"] = query;
+            output["source"] = searchUrl;
+            output["count"] = results.size();
+            output["results"] = results;
+            return QJsonDocument(output).toJson(QJsonDocument::Compact);
+        }
         return "ERROR: unknown tool " + name;
     }
+
     bool executeToolCall(const QString &text) {
         QRegularExpression re("```tool_call\\s*\\n?([\\s\\S]*?)```"); auto match = re.match(text); if (!match.hasMatch()) return false;
         QJsonDocument doc = QJsonDocument::fromJson(match.captured(1).trimmed().toUtf8()); QJsonObject call = doc.object(); if (call.isEmpty()) return false;
@@ -140,14 +421,29 @@ private:
         QString text = input->toPlainText().trimmed(); if (text.isEmpty()) return; input->clear(); history.append(QJsonObject{{"role", "user"}, {"content", text}}); appendSession(QJsonObject{{"role", "user"}, {"content", text}}); addBubble("You", text, "", true); requestStep = 0; requestCompletion();
     }
     void requestCompletion() {
-        QJsonObject body{{"model", cfg["model"].toString()}, {"messages", apiMessages()}, {"stream", false}}; QString thinking = cfg["thinking"].toString(); if (!thinking.isEmpty()) body["thinking"] = QJsonObject{{"type", thinking}}; QString effort=cfg["reasoning_effort"].toString(); if(!effort.isEmpty()) body["reasoning_effort"]=effort;
-        QNetworkRequest request(QUrl(cfg["baseURL"].toString())); request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json"); request.setRawHeader("Authorization", ("Bearer " + cfg["apiKey"].toString()).toUtf8()); send->setEnabled(false); send->setText("Working...");
-        QNetworkReply *reply = network.post(request, QJsonDocument(body).toJson()); connect(reply, &QNetworkReply::finished, this, [this, reply] {
-            send->setText("Send"); send->setEnabled(!input->toPlainText().trimmed().isEmpty()); if (reply->error() != QNetworkReply::NoError) { addBubble("Error", reply->errorString(), "", false); reply->deleteLater(); return; }
-            QJsonArray choices = QJsonDocument::fromJson(reply->readAll()).object()["choices"].toArray(); if (choices.isEmpty()) { addBubble("Error", "The API response has no choices.", "", false); reply->deleteLater(); return; }
-            QJsonObject message = choices.at(0).toObject()["message"].toObject(); QString answer = message["content"].toString(); QString reasoning = message["reasoning_content"].toString(); int a = answer.indexOf("<think>"), b = answer.indexOf("</think>"); if (a >= 0 && b > a) { reasoning = answer.mid(a + 7, b - a - 7); answer.remove(a, b + 8 - a); }
+        QJsonObject body{{"model", cfg["model"].toString()}, {"messages", apiMessages()}, {"stream", false}};
+        QString thinking = cfg["thinking"].toString(); if (!thinking.isEmpty()) body["thinking"] = QJsonObject{{"type", thinking}};
+        QString effort = cfg["reasoning_effort"].toString(); if (!effort.isEmpty()) body["reasoning_effort"] = effort;
+        QNetworkRequest request{QUrl(cfg["baseURL"].toString())};
+        request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        request.setRawHeader("Authorization", ("Bearer " + cfg["apiKey"].toString()).toUtf8());
+        send->setEnabled(false); send->setText("Working...");
+        QNetworkReply *reply = network.post(request, QJsonDocument(body).toJson());
+        connect(reply, &QNetworkReply::finished, this, [this, reply] {
+            send->setText("Send"); send->setEnabled(!input->toPlainText().trimmed().isEmpty());
+            if (reply->error() != QNetworkReply::NoError) { addBubble("Error", reply->errorString(), "", false); reply->deleteLater(); return; }
+            QJsonArray choices = QJsonDocument::fromJson(reply->readAll()).object()["choices"].toArray();
+            if (choices.isEmpty()) { addBubble("Error", "The API response has no choices.", "", false); reply->deleteLater(); return; }
+            QJsonObject message = choices.at(0).toObject()["message"].toObject();
+            QString answer = message["content"].toString();
+            QString reasoning = message["reasoning_content"].toString();
+            int a = answer.indexOf(""), b = answer.indexOf("</think>");
+            if (a >= 0 && b > a) { reasoning = answer.mid(a + 7, b - a - 7); answer.remove(a, b + 8 - a); }
             if (cfg["toolsEnabled"].toBool() && requestStep < 6 && executeToolCall(answer)) { reply->deleteLater(); return; }
-            history.append(QJsonObject{{"role", "assistant"}, {"content", answer}}); appendSession(QJsonObject{{"role", "assistant"}, {"content", answer}, {"reasoning", reasoning}}); addBubble("AI", answer, reasoning, false); reply->deleteLater();
+            history.append(QJsonObject{{"role", "assistant"}, {"content", answer}});
+            appendSession(QJsonObject{{"role", "assistant"}, {"content", answer}, {"reasoning", reasoning}});
+            addBubble("AI", answer, reasoning, false);
+            reply->deleteLater();
         });
     }
 };
