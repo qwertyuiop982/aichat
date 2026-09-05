@@ -35,7 +35,8 @@ async function requireConfigured() {
 function shellContext(cwd) { const raw = String(process.env.AICLAW_SHELL_ALLOWLIST || "").trim(); return { cwd: cwd || process.cwd(), allowShell: process.env.AICLAW_ALLOW_SHELL === "1", allowAllShell: process.env.AICLAW_SHELL_NO_ALLOWLIST === "1", allowCmds: raw ? raw.split(",").map(x => x.trim()).filter(Boolean) : null }; }
 const prog = new Command();
 prog
-  .name('aiclaw')
+  .name('aichat')
+  .alias('aiclaw')
   .description('AI Chat CLI - OpenAI-compatible with sessions')
   .version('0.4.0');
 prog.option('-y, --yes', 'skip interactive prompts (reserved)');

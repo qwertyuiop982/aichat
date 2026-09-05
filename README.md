@@ -9,13 +9,6 @@ Binary: `build/aiclaw-gui`
 Configuration: `~/.aiclaw/config.json`
 Sessions: `~/.aiclaw/sessions/*.jsonl`
 
-### Install build dependencies
-
-```sh
-pkg install x11-repo
-pkg install qt6-qtbase qt6-qttools qt6-qtbase-gtk-platformtheme cmake ninja clang
-```
-
 ### Build and start
 
 ```sh
